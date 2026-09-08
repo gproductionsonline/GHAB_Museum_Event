@@ -1,0 +1,503 @@
+// Government House CHOGM Event Guest & QR Check-In System
+// Normalized PostgreSQL schema (M0/M1 foundation).
+//
+// Conventions:
+// - String status fields are validated at the application layer (Zod) and
+//   constrained by service-level state transitions; enums that must be
+//   administrator-extensible (categories, RSVP states) are tables.
+// - Credential history is append-oriented: every issuance is a row; a guest
+//   points at its single ACTIVE credential via Guest.activeCredentialId
+//   (UNIQUE, nullable) so "one active credential per guest" is enforced by the
+//   database without partial indexes.
+// - AuditLog is append-only: no update path exists in application code.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// RBAC
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String
+  name         String
+  active       Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  roles     UserRole[]
+  auditLogs AuditLog[]
+  checkIns  CheckIn[]
+}
+
+model Role {
+  id          String  @id @default(uuid())
+  code        String  @unique // ADMIN | STAFF | CHECKIN_OPERATOR
+  name        String
+  description String?
+  users       UserRole[]
+  permissions RolePermission[]
+}
+
+model Permission {
+  id   String @id @default(uuid())
+  code String @unique // e.g. guest:write, credential:issue
+  name String
+  roles RolePermission[]
+}
+
+model UserRole {
+  userId String
+  roleId String
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+// ---------------------------------------------------------------------------
+// Events & configurable domain data
+// ---------------------------------------------------------------------------
+
+model Event {
+  id        String   @id @default(uuid())
+  publicId  String   @unique @default(uuid())
+  name      String
+  slug      String?  @unique
+  startsAt  DateTime
+  endsAt    DateTime?
+  venue     String?
+  timezone  String   @default("UTC")
+  status    String   @default("SCHEDULED") // DRAFT | SCHEDULED | LIVE | COMPLETED | CANCELLED
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gates            Gate[]
+  categories       GuestCategory[]
+  guests           Guest[]
+  credentials      CredentialVersion[]
+  checkIns         CheckIn[]
+  devices          Device[]
+  offlineCheckIns  OfflineCheckIn[]
+  importJobs       ImportJob[]
+  reportJobs       ReportJob[]
+  ticketTypes      TicketType[]
+  orders           Order[]
+  auditLogs        AuditLog[]
+}
+
+model Gate {
+  id      String  @id @default(uuid())
+  eventId String
+  event   Event   @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  name    String
+  code    String
+  sort    Int     @default(0)
+  active  Boolean @default(true)
+
+  @@unique([eventId, code])
+}
+
+// Administrator-configurable guest categories (event-scoped).
+model GuestCategory {
+  id          String   @id @default(uuid())
+  eventId     String
+  event       Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  code        String // e.g. VIP, OFFICIAL, STAFF, MEDIA, GENERAL_GUEST
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  sort        Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  guests Guest[]
+
+  @@unique([eventId, code])
+}
+
+// Extensible RSVP states (system table, seeded; not hard-coded in logic).
+model RsvpStatus {
+  id      String  @id @default(uuid())
+  code    String  @unique // PENDING | INVITED | CONFIRMED | DECLINED | CANCELLED
+  name    String
+  isFinal Boolean @default(false)
+  active  Boolean @default(true)
+  sort    Int     @default(0)
+
+  guests Guest[]
+}
+
+// ---------------------------------------------------------------------------
+// Guests (primary + accompanying via self-relation)
+// ---------------------------------------------------------------------------
+
+model Guest {
+  id        String @id @default(uuid())
+  publicId  String @unique @default(uuid())
+  eventId   String
+  event     Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  categoryId String
+  category  GuestCategory @relation(fields: [categoryId], references: [id])
+  rsvpStatusId String
+  rsvpStatus    RsvpStatus @relation(fields: [rsvpStatusId], references: [id])
+
+  // Accompanying relationship: a guest row with parentId set accompanies the
+  // primary guest. A companion cannot itself have companions (service rule).
+  parentId   String?
+  parent     Guest?  @relation("AccompanyingGuests", fields: [parentId], references: [id], onDelete: Cascade)
+  companions Guest[] @relation("AccompanyingGuests")
+
+  // Single-active-credential invariant, enforced by UNIQUE nullable pointer.
+  activeCredentialId String? @unique
+  credential         CredentialVersion? @relation("ActiveCredential", fields: [activeCredentialId], references: [id])
+
+  guestRef      String?
+  title         String?
+  firstName     String
+  lastName      String
+  displayName   String?
+  normalizedName String // lowercase "first last" for fast case-insensitive search
+  email         String?
+  phone         String?
+  organisation  String?
+  designation   String?
+  source        String   @default("MANUAL") // IMPORT | MANUAL | ONLINE
+  tableSeat     String?
+  invitedBy     String?
+  notes         String?
+  importJobId   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  credentials     CredentialVersion[] @relation("GuestCredentials")
+  checkIn         CheckIn?
+  emailDeliveries EmailDelivery[]
+
+  @@index([eventId, normalizedName])
+  @@index([eventId, lastName, firstName])
+  @@index([eventId, categoryId])
+  @@index([eventId, rsvpStatusId])
+  @@index([eventId, email])
+  @@index([parentId])
+}
+
+// ---------------------------------------------------------------------------
+// Credentials — append-oriented version history
+// ---------------------------------------------------------------------------
+
+model CredentialVersion {
+  id            String  @id @default(uuid())
+  publicId      String  @unique @default(uuid())
+  guestId       String
+  guest         Guest   @relation("GuestCredentials", fields: [guestId], references: [id], onDelete: Cascade)
+  eventId       String
+  event         Event   @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  versionNumber Int
+  codeHash      String  @unique // sha256 hex of the raw bearer token
+  codeEnc       String? // AES-256-GCM encrypted raw token (controlled re-display only)
+  codeLast4     String
+  status        String  @default("ACTIVE") // PENDING | ACTIVE | REVOKED | REPLACED | EXPIRED
+  issuedAt      DateTime @default(now())
+  revokedAt     DateTime?
+  revokedReason String?
+  expiresAt     DateTime?
+
+  activeForGuest  Guest?  @relation("ActiveCredential")
+  checkIns        CheckIn[]
+  emailDeliveries EmailDelivery[]
+
+  @@unique([guestId, versionNumber])
+  @@index([eventId, status])
+  @@index([guestId, issuedAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Check-in — the concurrency-critical table.
+// @@unique([eventId, credentialVersionId]) is the database-level guarantee
+// that a credential version can admit exactly once. operationId makes retries
+// idempotent.
+// ---------------------------------------------------------------------------
+
+model CheckIn {
+  id                 String   @id @default(uuid())
+  operationId        String   @unique
+  eventId            String
+  event              Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  guestId            String   @unique // one admission row per guest at a time
+  guest              Guest    @relation(fields: [guestId], references: [id], onDelete: Cascade)
+  credentialVersionId String
+  credential         CredentialVersion @relation(fields: [credentialVersionId], references: [id], onDelete: Cascade)
+  deviceId           String?
+  device             Device?  @relation(fields: [deviceId], references: [id])
+  operatorUserId      String?
+  operator           User?    @relation(fields: [operatorUserId], references: [id])
+  method             String // QR | MANUAL | OFFLINE_SYNC
+  gate               String?
+  scannedAt          DateTime @default(now())
+  clientTimestamp    DateTime? // original device clock for offline scans
+  createdAt          DateTime @default(now())
+
+  offlineCheckIn OfflineCheckIn?
+
+  @@unique([eventId, credentialVersionId])
+  @@index([eventId, scannedAt(sort: Desc)])
+  @@index([eventId, deviceId, scannedAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Offline admission foundation (device authorization + reconciliation)
+// ---------------------------------------------------------------------------
+
+model Device {
+  id         String    @id @default(uuid())
+  publicId   String    @unique @default(uuid())
+  eventId    String
+  event      Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  name       String
+  deviceType String? // PHONE | TABLET | KIOSK
+  tokenHash  String?   @unique // device credential hash (provisioning workflow: M3)
+  status     String    @default("ACTIVE") // ACTIVE | REVOKED
+  expiresAt  DateTime?
+  lastSeenAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  checkIns       CheckIn[]
+  offlineCheckIns OfflineCheckIn[]
+  auditLogs      AuditLog[]
+
+  @@unique([eventId, name])
+  @@index([eventId, status])
+}
+
+// One row per offline operation received from a device. Unique (deviceId,
+// operationId) makes synchronization idempotent; rows are retained even when
+// rejected (evidence + conflict review).
+model OfflineCheckIn {
+  id              String   @id @default(uuid())
+  deviceId        String
+  device          Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  eventId         String
+  event           Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  operationId     String // device-generated operation id
+  codeHash        String
+  gate            String?
+  clientTimestamp DateTime
+  receivedAt      DateTime @default(now())
+  status          String   @default("PENDING") // PENDING | APPLIED | ALREADY_CHECKED_IN | INVALID | CANCELLED | REPLACED | EXPIRED | CONFLICT
+  resultDetail    String?
+  checkInId       String?  @unique
+  checkIn         CheckIn? @relation(fields: [checkInId], references: [id])
+  createdAt       DateTime @default(now())
+
+  @@unique([deviceId, operationId])
+  @@index([eventId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Imports, email, reports
+// ---------------------------------------------------------------------------
+
+model ImportJob {
+  id              String    @id @default(uuid())
+  eventId         String
+  event           Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  filename        String
+  contentDigest   String?
+  status          String    @default("PREVIEW") // PREVIEW | QUEUED | PROCESSING | COMPLETED | FAILED | CANCELLED
+  totalRows       Int       @default(0)
+  validRows       Int       @default(0)
+  errorCount      Int       @default(0)
+  skippedRows     Int       @default(0)
+  rowsJson        String? // staged, validated rows awaiting processing (cleared on completion)
+  resultJson      String? // worker-written summary: counts and failures
+  idempotencyKey  String?
+  createdByUserId String?
+  committedAt     DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  rowErrors ImportRowError[]
+
+  @@index([eventId, createdAt(sort: Desc)])
+}
+
+model ImportRowError {
+  id          String    @id @default(uuid())
+  importJobId String
+  importJob   ImportJob @relation(fields: [importJobId], references: [id], onDelete: Cascade)
+  rowNumber   Int
+  field       String?
+  message     String
+  createdAt   DateTime  @default(now())
+
+  @@index([importJobId, rowNumber])
+}
+
+model EmailDelivery {
+  id                  String   @id @default(uuid())
+  guestId             String
+  guest               Guest    @relation(fields: [guestId], references: [id], onDelete: Cascade)
+  credentialVersionId String
+  credential          CredentialVersion @relation(fields: [credentialVersionId], references: [id], onDelete: Cascade)
+  idempotencyKey      String   @unique // prevents duplicate delivery for the same logical send
+  recipient           String
+  subject             String
+  template            String   @default("CREDENTIAL_QR")
+  status              String   @default("QUEUED") // QUEUED | SENDING | SENT | FAILED
+  attempts            Int      @default(0)
+  nextAttemptAt       DateTime?
+  provider            String?
+  providerRef         String?
+  error               String?
+  sentAt              DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([status, nextAttemptAt])
+  @@index([credentialVersionId])
+}
+
+model ReportJob {
+  id              String    @id @default(uuid())
+  eventId         String
+  event           Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  type            String // GUEST_LIST | ATTENDANCE | DOOR_LIST | AUDIT
+  format          String    @default("CSV") // CSV | XLSX
+  filtersJson     String?
+  status          String    @default("QUEUED") // QUEUED | PROCESSING | COMPLETED | FAILED
+  fileRef         String?
+  error           String?
+  createdByUserId String?
+  expiresAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([eventId, createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Audit — append-only. No update/delete paths in application code.
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  requestId   String?
+  actorUserId String?
+  actor       User?    @relation(fields: [actorUserId], references: [id])
+  actorLabel  String?
+  eventId     String?
+  event       Event?   @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  deviceId    String?
+  device      Device?  @relation(fields: [deviceId], references: [id])
+  action      String
+  entityType  String
+  entityId    String?
+  result      String   @default("SUCCESS") // SUCCESS | FAILURE
+  summary     String
+  beforeJson  String?
+  afterJson   String?
+  createdAt   DateTime @default(now())
+
+  @@index([eventId, createdAt(sort: Desc)])
+  @@index([entityType, entityId, createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 payment boundary — tables exist for forward compatibility but no
+// Phase 1 runtime behavior touches them.
+// ---------------------------------------------------------------------------
+
+model TicketType {
+  id         String   @id @default(uuid())
+  eventId    String
+  event      Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  name       String
+  priceMinor Int      @default(0) // minor units (e.g. cents of XCD)
+  currency   String   @default("XCD")
+  capacity   Int?
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  orderItems OrderItem[]
+
+  @@unique([eventId, name])
+}
+
+model Order {
+  id               String   @id @default(uuid())
+  eventId          String
+  event            Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  status           String   @default("PENDING") // PENDING | PAID | FULFILLED | CANCELLED | REFUNDED
+  source           String   @default("ONLINE")
+  totalAmountMinor Int      @default(0)
+  currency         String   @default("XCD")
+  customerEmail    String?
+  idempotencyKey   String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  items    OrderItem[]
+  payments Payment[]
+}
+
+model OrderItem {
+  id             String     @id @default(uuid())
+  orderId        String
+  order          Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  ticketTypeId   String
+  ticketType     TicketType @relation(fields: [ticketTypeId], references: [id])
+  quantity       Int
+  unitPriceMinor Int
+  guestId        String? // set at fulfilment; links a paid ticket to a Guest
+}
+
+model PaymentProvider {
+  id        String  @id @default(uuid())
+  code      String  @unique // e.g. LOCAL_BANK
+  name      String
+  active    Boolean @default(true)
+  configJson String? // non-secret configuration reference only
+
+  payments Payment[]
+}
+
+model Payment {
+  id          String   @id @default(uuid())
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  providerId  String?
+  provider    PaymentProvider? @relation(fields: [providerId], references: [id])
+  providerRef String?
+  amountMinor Int
+  currency    String
+  status      String   @default("PENDING") // PENDING | AUTHORIZED | CAPTURED | FAILED | REFUNDED
+  failureCode String?
+  rawRef      String? // reference to retained raw provider response if approved
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([orderId])
+}

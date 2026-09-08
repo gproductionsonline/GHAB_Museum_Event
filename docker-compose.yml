@@ -1,0 +1,42 @@
+services:
+  # Development database (primary).
+  # NOTE: host port is 5435 because a native PostgreSQL installation is already
+  # listening on 5432 on this machine. If you stop the native service you can
+  # change this mapping back to "5432:5432".
+  postgres:
+    image: postgres:17-alpine
+    container_name: ghab-postgres
+    environment:
+      POSTGRES_USER: gh_events
+      POSTGRES_PASSWORD: gh_events_dev
+      POSTGRES_DB: gh_events
+    ports:
+      - "5435:5432"
+    volumes:
+      - ghab_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gh_events -d gh_events"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Integration-test database (ephemeral, isolated from dev data)
+  postgres-test:
+    image: postgres:17-alpine
+    container_name: ghab-postgres-test
+    environment:
+      POSTGRES_USER: gh_events
+      POSTGRES_PASSWORD: gh_events_dev
+      POSTGRES_DB: gh_events_test
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gh_events -d gh_events_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  ghab_pgdata:

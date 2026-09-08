@@ -1,0 +1,34 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f4f5f7;
+  --foreground: #111827;
+  --navy: #0f2a4a;
+  --gold: #d4af37;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-navy: var(--navy);
+  --color-gold: var(--gold);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+input,
+select,
+textarea {
+  color-scheme: light;
+}
+
+/* Scanner PWA: keep the screen awake-friendly, no text selection on buttons */
+.no-select {
+  -webkit-user-select: none;
+  user-select: none;
+}

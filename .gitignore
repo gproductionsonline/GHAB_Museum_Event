@@ -1,0 +1,17 @@
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# dependencies (packages live in backend/ and frontend/)
+node_modules/
+
+# logs / process files / local data
+*.log
+*.pid
+coverage/
+.env
+.env.local
+.env.*.local

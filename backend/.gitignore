@@ -1,0 +1,11 @@
+node_modules
+.env
+.env.*
+!.env.example
+dist
+dev.db
+*.db-journal
+.data
+src/generated
+uploads
+*.log
